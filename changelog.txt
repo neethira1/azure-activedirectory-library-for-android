@@ -1,3 +1,7 @@
+Version 1.2.1
+--------------
+(Security Fix) Update for validating broker apps signature. Will only allow one signature for broker app, and it has the be the one the sdk trusts
+
 Version 1.2.0
 --------------
 Add support for family ClientId
