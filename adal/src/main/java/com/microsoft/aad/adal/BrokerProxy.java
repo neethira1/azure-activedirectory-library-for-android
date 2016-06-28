@@ -570,21 +570,24 @@ class BrokerProxy implements IBrokerProxy {
             // Read all the certificates associated with the package name. In higher version of
             // android sdk, package manager will only returned the cert that is used to sign the
             // APK. Even a cert is claimed to be issued by another certificates, sdk will return
-            // the signed. However, for the lower version of android, it will return all the
-            // certs in the chain. We need to verify
+            // the signing cert. However, for the lower version of android, it will return all the
+            // certs in the chain. We need to verify that the cert chain is correctly chained up.
             final List<X509Certificate> certs = readCertDataForBrokerApp(brokerPackageName);
 
             // If there is only one cert returned, no need to perform certificate chain validation.
             // It should be 1) only one self signed cert exists 2) The OS iteslf is only returning
             // back the signing cert. We only need to validate the signing cert signature matches
             // what we hardcoded.
+            final X509Certificate signingCert;
             if (certs.size() == 1) {
-                return verifySignatureHash(certs.get(0));
+                signingCert = certs.get(0);
+            } else {
+                // Verify the certificate chain is chained correctly.
+                signingCert = getSignerCertAndVerifyCertificateChain(certs);
             }
 
-            // Verify the certificate chain is chained correctly.
-            final X509Certificate singingCert = getSignerCertAndVerifyCertificateChain(certs);
-            return verifySignatureHash(singingCert);
+            verifySignatureHash(signingCert);
+            return true;
         } catch (NameNotFoundException e) {
             Logger.e(TAG, "Broker related package does not exist", "", ADALError.BROKER_PACKAGE_NAME_NOT_FOUND);
         } catch (NoSuchAlgorithmException e) {
@@ -596,19 +599,17 @@ class BrokerProxy implements IBrokerProxy {
         return false;
     }
 
-    boolean verifySignatureHash(final X509Certificate signerCert) throws NoSuchAlgorithmException,
+    void verifySignatureHash(final X509Certificate signerCert) throws NoSuchAlgorithmException,
             CertificateEncodingException, AuthenticationException {
         final MessageDigest messageDigest = MessageDigest.getInstance("SHA");
         messageDigest.update(signerCert.getEncoded());
 
         // Check the hash for signer cert is the same as what we hardcoded.
-        final String tag = Base64.encodeToString(messageDigest.digest(), Base64.NO_WRAP);
-        if (!mBrokerTag.equals(tag) &&
-                !AuthenticationConstants.Broker.AZURE_AUTHENTICATOR_APP_SIGNATURE.equals(tag)) {
+        final String signatureHash = Base64.encodeToString(messageDigest.digest(), Base64.NO_WRAP);
+        if (!mBrokerTag.equals(signatureHash) &&
+                !AuthenticationConstants.Broker.AZURE_AUTHENTICATOR_APP_SIGNATURE.equals(signatureHash)) {
             throw new AuthenticationException(ADALError.BROKER_APP_VERIFICATION_FAILED);
         }
-
-        return true;
     }
 
     private List<X509Certificate> readCertDataForBrokerApp(final String brokerPackageName)
@@ -652,23 +653,15 @@ class BrokerProxy implements IBrokerProxy {
         // create certificate chain, find the self signed cert first and chain all the way back
         // to the signer cert. Also perform certificate signing validation when chaining them back.
         X509Certificate issuerCert = getSelfSignedCert(certificates);
-        X509Certificate intermediateCert;
-        int count = 1;
-        while (true) {
+        X509Certificate intermediateCert = null;
+
+        for (int count = 1; count < certificates.size(); count++) {
             intermediateCert = findCert(issuerCert.getSubjectDN(),
                     certificates);
-            if (intermediateCert == null) {
-                throw new AuthenticationException(ADALError.BROKER_APP_VERIFICATION_FAILED);
-            }
 
             //verify certificate is signed with the public key of the issuer certificate
             intermediateCert.verify(issuerCert.getPublicKey());
             issuerCert = intermediateCert;
-
-            count++;
-            if (count == certificates.size()) {
-                break;
-            }
         }
 
         return intermediateCert;
@@ -682,12 +675,13 @@ class BrokerProxy implements IBrokerProxy {
         for (final X509Certificate x509Certificate : certs) {
             if (x509Certificate.getSubjectDN().equals(x509Certificate.getIssuerDN())) {
                 selfSignedCert = x509Certificate;
-                count ++;
+                count++;
             }
         }
 
-        if (count > 1) {
-            throw new AuthenticationException(ADALError.BROKER_APP_VERIFICATION_FAILED);
+        if (count > 1 || selfSignedCert == null) {
+            throw new AuthenticationException(ADALError.BROKER_APP_VERIFICATION_FAILED,
+                    "Multiple self signed certs found or no self signed cert existed.");
         }
 
         return selfSignedCert;
@@ -697,8 +691,7 @@ class BrokerProxy implements IBrokerProxy {
             throws AuthenticationException {
         X509Certificate intermediateCert = null;
         int count = 0;
-        for (int i = 0; i < certs.size(); i++) {
-            final X509Certificate cert = certs.get(i);
+        for (final X509Certificate cert : certs) {
             if (cert.getIssuerDN().equals(issuer)
                     && !cert.getIssuerDN().equals(cert.getSubjectDN())) {
                 intermediateCert = cert;
@@ -706,10 +699,10 @@ class BrokerProxy implements IBrokerProxy {
             }
         }
 
-        if (count > 1) {
+        if (count > 1 || intermediateCert == null) {
             throw new AuthenticationException(ADALError.BROKER_APP_VERIFICATION_FAILED, "Failed to" +
-                    " create certificate chain, multiple certs claim to be issued by the same " +
-                    "issuer cert.");
+                    " validate certificate chain, multiple certs claim to be issued by the same " +
+                    "issuer cert or no intermediate cert found.");
         }
 
         return intermediateCert;
