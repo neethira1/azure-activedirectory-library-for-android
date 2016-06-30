@@ -28,13 +28,17 @@ import java.io.InputStream;
 import java.security.GeneralSecurityException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
-import java.security.Principal;
+import java.security.cert.CertPath;
+import java.security.cert.CertPathValidator;
 import java.security.cert.CertificateEncodingException;
 import java.security.cert.CertificateException;
 import java.security.cert.CertificateFactory;
+import java.security.cert.PKIXParameters;
+import java.security.cert.TrustAnchor;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.Calendar;
+import java.util.Collections;
 import java.util.Date;
 import java.util.GregorianCalendar;
 import java.util.List;
@@ -574,19 +578,15 @@ class BrokerProxy implements IBrokerProxy {
             // certs in the chain. We need to verify that the cert chain is correctly chained up.
             final List<X509Certificate> certs = readCertDataForBrokerApp(brokerPackageName);
 
-            // If there is only one cert returned, no need to perform certificate chain validation.
-            // It should be 1) only one self signed cert exists 2) The OS iteslf is only returning
-            // back the signing cert. We only need to validate the signing cert signature matches
-            // what we hardcoded.
-            final X509Certificate signingCert;
-            if (certs.size() == 1) {
-                signingCert = certs.get(0);
-            } else {
-                // Verify the certificate chain is chained correctly.
-                signingCert = getSignerCertAndVerifyCertificateChain(certs);
+            // Verify the cert list contains the cert we trust.
+            verifySignatureHash(certs);
+
+            // Perform the certificate chain validation. If there is only one cert returned,
+            // no need to perform certificate chain validation.
+            if (certs.size() > 1) {
+                verifyCertificateChain(certs);
             }
 
-            verifySignatureHash(signingCert);
             return true;
         } catch (NameNotFoundException e) {
             Logger.e(TAG, "Broker related package does not exist", "", ADALError.BROKER_PACKAGE_NAME_NOT_FOUND);
@@ -599,17 +599,21 @@ class BrokerProxy implements IBrokerProxy {
         return false;
     }
 
-    void verifySignatureHash(final X509Certificate signerCert) throws NoSuchAlgorithmException,
+    void verifySignatureHash(final List<X509Certificate> certs) throws NoSuchAlgorithmException,
             CertificateEncodingException, AuthenticationException {
-        final MessageDigest messageDigest = MessageDigest.getInstance("SHA");
-        messageDigest.update(signerCert.getEncoded());
+        for (final X509Certificate x509Certificate : certs) {
+            final MessageDigest messageDigest = MessageDigest.getInstance("SHA");
+            messageDigest.update(x509Certificate.getEncoded());
 
-        // Check the hash for signer cert is the same as what we hardcoded.
-        final String signatureHash = Base64.encodeToString(messageDigest.digest(), Base64.NO_WRAP);
-        if (!mBrokerTag.equals(signatureHash) &&
-                !AuthenticationConstants.Broker.AZURE_AUTHENTICATOR_APP_SIGNATURE.equals(signatureHash)) {
-            throw new AuthenticationException(ADALError.BROKER_APP_VERIFICATION_FAILED);
+            // Check the hash for signer cert is the same as what we hardcoded.
+            final String signatureHash = Base64.encodeToString(messageDigest.digest(), Base64.NO_WRAP);
+            if (mBrokerTag.equals(signatureHash) ||
+                    AuthenticationConstants.Broker.AZURE_AUTHENTICATOR_APP_SIGNATURE.equals(signatureHash)) {
+                return;
+            }
         }
+        
+        throw new AuthenticationException(ADALError.BROKER_APP_VERIFICATION_FAILED);
     }
 
     private List<X509Certificate> readCertDataForBrokerApp(final String brokerPackageName)
@@ -647,24 +651,19 @@ class BrokerProxy implements IBrokerProxy {
         return certificates;
     }
 
-    private X509Certificate getSignerCertAndVerifyCertificateChain(
-            final List<X509Certificate> certificates)
+    private void verifyCertificateChain(final List<X509Certificate> certificates)
             throws GeneralSecurityException, AuthenticationException {
         // create certificate chain, find the self signed cert first and chain all the way back
         // to the signer cert. Also perform certificate signing validation when chaining them back.
         X509Certificate issuerCert = getSelfSignedCert(certificates);
-        X509Certificate intermediateCert = null;
+        final TrustAnchor trustAnchor = new TrustAnchor(issuerCert, null);
+        PKIXParameters pkixParameters = new PKIXParameters(Collections.singleton(trustAnchor));
+        pkixParameters.setRevocationEnabled(false);
+        final CertPath certPath = CertificateFactory.getInstance("X.509")
+                .generateCertPath(certificates);
 
-        for (int count = 1; count < certificates.size(); count++) {
-            intermediateCert = findCert(issuerCert.getSubjectDN(),
-                    certificates);
-
-            //verify certificate is signed with the public key of the issuer certificate
-            intermediateCert.verify(issuerCert.getPublicKey());
-            issuerCert = intermediateCert;
-        }
-
-        return intermediateCert;
+        final CertPathValidator certPathValidator = CertPathValidator.getInstance("PKIX");
+        certPathValidator.validate(certPath, pkixParameters);
     }
 
     // Will throw if there is more than one self-signed cert found.
@@ -685,27 +684,6 @@ class BrokerProxy implements IBrokerProxy {
         }
 
         return selfSignedCert;
-    }
-
-    final X509Certificate findCert(final Principal issuer, final List<X509Certificate> certs)
-            throws AuthenticationException {
-        X509Certificate intermediateCert = null;
-        int count = 0;
-        for (final X509Certificate cert : certs) {
-            if (cert.getIssuerDN().equals(issuer)
-                    && !cert.getIssuerDN().equals(cert.getSubjectDN())) {
-                intermediateCert = cert;
-                count ++;
-            }
-        }
-
-        if (count > 1 || intermediateCert == null) {
-            throw new AuthenticationException(ADALError.BROKER_APP_VERIFICATION_FAILED, "Failed to" +
-                    " validate certificate chain, multiple certs claim to be issued by the same " +
-                    "issuer cert or no intermediate cert found.");
-        }
-
-        return intermediateCert;
     }
 
     private boolean verifyAuthenticator(final AccountManager am) {
